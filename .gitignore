@@ -1,10 +1,10 @@
-# Python-generated files
+.DS_Store
+.env
+.env.*
+!.env.example
+.python-version
+.pytest_cache/
+.venv/
+.vercel/
 __pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
+*.py[cod]

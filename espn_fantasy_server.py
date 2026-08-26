@@ -1,375 +1,303 @@
-from mcp.server.fastmcp import FastMCP
-from espn_api.football import League
-import sys
-import datetime
+"""ESPN Fantasy Football tools exposed through Model Context Protocol."""
+
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
 import logging
-import traceback
+import os
+import threading
+from typing import Any
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+from espn_api.football import League
+from mcp.server import MCPServer
 
-# Add stderr logging for Claude Desktop to see
-def log_error(message):
-    print(message, file=sys.stderr)
 
-try:
-    # Initialize FastMCP server
-    log_error("Initializing FastMCP server...")
-    mcp = FastMCP("espn-fantasy-football", dependencies=['espn-api'])
+LOGGER = logging.getLogger("mcp_espn_ff")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 
-    # Constants
-    CURRENT_YEAR = datetime.datetime.now().year
-    if datetime.datetime.now().month < 7:  # If before July, use previous year
-        CURRENT_YEAR -= 1
 
-    log_error(f"Using football year: {CURRENT_YEAR}")
+def default_season() -> int:
+    """Return the active NFL fantasy season."""
+    today = dt.datetime.now(dt.timezone.utc).date()
+    return today.year if today.month >= 7 else today.year - 1
 
-    class ESPNFantasyFootballAPI:
-        def __init__(self):
-            self.leagues = {}  # Cache for league objects
-            # Store credentials separately per-session rather than globally
-            self.credentials = {}
-        
-        def get_league(self, session_id, league_id, year=CURRENT_YEAR):
-            """Get a league instance with caching, using stored credentials if available"""
-            key = f"{league_id}_{year}"
-            
-            # Check if we have credentials for this session
-            espn_s2 = None
-            swid = None
-            if session_id in self.credentials:
-                espn_s2 = self.credentials[session_id].get('espn_s2')
-                swid = self.credentials[session_id].get('swid')
-            
-            # Create league cache key including auth info
-            cache_key = f"{key}_{espn_s2}_{swid}"
-            
-            if cache_key not in self.leagues:
-                log_error(f"Creating new league instance for {league_id}, year {year}")
-                try:
-                    self.leagues[cache_key] = League(league_id=league_id, year=year, espn_s2=espn_s2, swid=swid)
-                except Exception as e:
-                    log_error(f"Error creating league: {str(e)}")
-                    raise
-            
-            return self.leagues[cache_key]
-        
-        def store_credentials(self, session_id, espn_s2, swid):
-            """Store credentials for a session"""
-            self.credentials[session_id] = {
-                'espn_s2': espn_s2,
-                'swid': swid
-            }
-            log_error(f"Stored credentials for session {session_id}")
-        
-        def clear_credentials(self, session_id):
-            """Clear credentials for a session"""
-            if session_id in self.credentials:
-                del self.credentials[session_id]
-                log_error(f"Cleared credentials for session {session_id}")
 
-    # Create our API instance
-    api = ESPNFantasyFootballAPI()
+CURRENT_YEAR = default_season()
 
-    # Store a session map
-    SESSION_ID = "default_session"
 
-    @mcp.tool()
-    async def authenticate(espn_s2: str, swid: str) -> str:
-        """Store ESPN authentication credentials for this session.
-        
-        Args:
-            espn_s2: The ESPN_S2 cookie value from your ESPN account
-            swid: The SWID cookie value from your ESPN account
-        """
-        try:
-            log_error("Authenticating...")
-            # Store credentials for this session
-            api.store_credentials(SESSION_ID, espn_s2, swid)
-            
-            return "Authentication successful. Your credentials are stored for this session only."
-        except Exception as e:
-            log_error(f"Authentication error: {str(e)}")
-            traceback.print_exc(file=sys.stderr)
-            return f"Authentication error: {str(e)}"
+class ESPNConfigurationError(RuntimeError):
+    """Raised when ESPN credential environment variables are incomplete."""
 
-    @mcp.tool()
-    async def get_league_info(league_id: int, year: int = CURRENT_YEAR) -> str:
-        """Get basic information about a fantasy football league.
-        
-        Args:
-            league_id: The ESPN fantasy football league ID
-            year: Optional year for historical data (defaults to current season)
-        """
-        try:
-            log_error(f"Getting league info for league {league_id}, year {year}")
-            # Get league using stored credentials
-            league = api.get_league(SESSION_ID, league_id, year)
-            
-            info = {
-                "name": league.settings.name,
-                "year": league.year,
-                "current_week": league.current_week,
-                "nfl_week": league.nfl_week,
-                "team_count": len(league.teams),
-                "teams": [team.team_name for team in league.teams],
-                "scoring_type": league.settings.scoring_type,
-            }
-            
-            return str(info)
-        except Exception as e:
-            log_error(f"Error retrieving league info: {str(e)}")
-            traceback.print_exc(file=sys.stderr)
-            if "401" in str(e) or "Private" in str(e):
-                return ("This appears to be a private league. Please use the authenticate tool first with your "
-                      "ESPN_S2 and SWID cookies to access private leagues.")
-            return f"Error retrieving league: {str(e)}"
 
-    @mcp.tool()
-    async def get_team_roster(league_id: int, team_id: int, year: int = CURRENT_YEAR) -> str:
-        """Get a team's current roster.
-        
-        Args:
-            league_id: The ESPN fantasy football league ID
-            team_id: The team ID in the league (usually 1-12)
-            year: Optional year for historical data (defaults to current season)
-        """
-        try:
-            log_error(f"Getting team roster for league {league_id}, team {team_id}, year {year}")
-            # Get league using stored credentials
-            league = api.get_league(SESSION_ID, league_id, year)
-            
-            # Team IDs in ESPN API are 1-based
-            if team_id < 1 or team_id > len(league.teams):
-                return f"Invalid team_id. Must be between 1 and {len(league.teams)}"
-            
-            team = league.teams[team_id - 1]
-            
-            roster_info = {
-                "team_name": team.team_name,
-                "owner": team.owners,
-                "wins": team.wins,
-                "losses": team.losses, 
-                "roster": []
-            }
-            
-            for player in team.roster:
-                roster_info["roster"].append({
+def _credentials() -> tuple[str | None, str | None]:
+    espn_s2 = os.getenv("ESPN_S2") or None
+    swid = os.getenv("ESPN_SWID") or None
+    if bool(espn_s2) != bool(swid):
+        raise ESPNConfigurationError(
+            "Private leagues require both ESPN_S2 and ESPN_SWID environment variables."
+        )
+    return espn_s2, swid
+
+
+def _credential_fingerprint(espn_s2: str | None, swid: str | None) -> str:
+    if not espn_s2 or not swid:
+        return "public"
+    return hashlib.sha256(f"{espn_s2}\0{swid}".encode()).hexdigest()
+
+
+class ESPNFantasyFootballAPI:
+    """Create and reuse ESPN league clients without retaining raw credentials in keys."""
+
+    def __init__(self, max_cached_leagues: int = 32) -> None:
+        self._leagues: dict[tuple[int, int, str], League] = {}
+        self._lock = threading.Lock()
+        self._max_cached_leagues = max_cached_leagues
+
+    def clear_cache(self) -> None:
+        with self._lock:
+            self._leagues.clear()
+
+    def get_league(self, league_id: int, year: int = CURRENT_YEAR) -> League:
+        if league_id <= 0:
+            raise ValueError("league_id must be a positive integer")
+        if year < 2000 or year > dt.datetime.now(dt.timezone.utc).year + 1:
+            raise ValueError("year must be a valid ESPN fantasy football season")
+
+        espn_s2, swid = _credentials()
+        cache_key = (league_id, year, _credential_fingerprint(espn_s2, swid))
+
+        with self._lock:
+            cached = self._leagues.get(cache_key)
+        if cached is not None:
+            return cached
+
+        LOGGER.info("Creating ESPN league client league_id=%s year=%s", league_id, year)
+        league = League(
+            league_id=league_id,
+            year=year,
+            espn_s2=espn_s2,
+            swid=swid,
+        )
+
+        with self._lock:
+            if len(self._leagues) >= self._max_cached_leagues:
+                self._leagues.pop(next(iter(self._leagues)))
+            return self._leagues.setdefault(cache_key, league)
+
+
+def _error_message(error: Exception) -> str:
+    message = str(error)
+    lowered = message.lower()
+    if "401" in message or "private" in lowered or "unauthorized" in lowered:
+        return (
+            "ESPN rejected access to this league. For a private league, configure "
+            "ESPN_S2 and ESPN_SWID on the server, then redeploy."
+        )
+    return f"ESPN request failed: {message}"
+
+
+def _team_by_id(league: League, team_id: int) -> Any:
+    # ESPN team ids are not guaranteed to match list positions in every season.
+    for team in league.teams:
+        if getattr(team, "team_id", None) == team_id:
+            return team
+    if 1 <= team_id <= len(league.teams):
+        return league.teams[team_id - 1]
+    raise ValueError(f"team_id must identify one of the league's {len(league.teams)} teams")
+
+
+api = ESPNFantasyFootballAPI()
+mcp = MCPServer(
+    "espn-fantasy-football",
+    version="0.2.0",
+    description="Read ESPN fantasy football league, roster, player, standings, and matchup data.",
+    instructions=(
+        "Use the requested league id and season. Private-league credentials are configured "
+        "by the server owner and must never be requested from the user in tool arguments."
+    ),
+)
+
+
+@mcp.tool()
+def get_league_info(league_id: int, year: int = CURRENT_YEAR) -> dict[str, Any] | str:
+    """Get basic information about an ESPN fantasy football league."""
+    try:
+        league = api.get_league(league_id, year)
+        return {
+            "name": league.settings.name,
+            "year": league.year,
+            "current_week": league.current_week,
+            "nfl_week": league.nfl_week,
+            "team_count": len(league.teams),
+            "teams": [team.team_name for team in league.teams],
+            "scoring_type": league.settings.scoring_type,
+        }
+    except Exception as error:
+        LOGGER.exception("Unable to retrieve league info")
+        return _error_message(error)
+
+
+@mcp.tool()
+def get_team_roster(
+    league_id: int, team_id: int, year: int = CURRENT_YEAR
+) -> dict[str, Any] | str:
+    """Get a team's roster and player totals."""
+    try:
+        league = api.get_league(league_id, year)
+        team = _team_by_id(league, team_id)
+        return {
+            "team_id": getattr(team, "team_id", team_id),
+            "team_name": team.team_name,
+            "owners": team.owners,
+            "wins": team.wins,
+            "losses": team.losses,
+            "roster": [
+                {
                     "name": player.name,
                     "position": player.position,
-                    "proTeam": player.proTeam,
+                    "pro_team": player.proTeam,
                     "points": player.total_points,
                     "projected_points": player.projected_total_points,
-                    "stats": player.stats
-                })
-            
-            return str(roster_info)
-        except Exception as e:
-            log_error(f"Error retrieving team roster: {str(e)}")
-            traceback.print_exc(file=sys.stderr)
-            if "401" in str(e) or "Private" in str(e):
-                return ("This appears to be a private league. Please use the authenticate tool first with your "
-                      "ESPN_S2 and SWID cookies to access private leagues.")
-            return f"Error retrieving team roster: {str(e)}"
-        
-    @mcp.tool()
-    async def get_team_info(league_id: int, team_id: int, year: int = CURRENT_YEAR) -> str:
-        """Get a team's general information. Including points scored, transactions, etc.
+                }
+                for player in team.roster
+            ],
+        }
+    except Exception as error:
+        LOGGER.exception("Unable to retrieve team roster")
+        return _error_message(error)
 
-        Args:
-            league_id: The ESPN fantasy football league ID
-            team_id: The team ID in the league (usually 1-12)
-            year: Optional year for historical data (defaults to current season)
-        """
-        try:
-            log_error(f"Getting team info for league {league_id}, team {team_id}, year {year}")
-            # Get league using stored credentials
-            league = api.get_league(SESSION_ID, league_id, year)
 
-            # Team IDs in ESPN API are 1-based
-            if team_id < 1 or team_id > len(league.teams):
-                return f"Invalid team_id. Must be between 1 and {len(league.teams)}"
-            
-            team = league.teams[team_id - 1]
+@mcp.tool()
+def get_team_info(
+    league_id: int, team_id: int, year: int = CURRENT_YEAR
+) -> dict[str, Any] | str:
+    """Get a team's record, scoring totals, transactions, and final standing."""
+    try:
+        league = api.get_league(league_id, year)
+        team = _team_by_id(league, team_id)
+        return {
+            "team_id": getattr(team, "team_id", team_id),
+            "team_name": team.team_name,
+            "owners": team.owners,
+            "wins": team.wins,
+            "losses": team.losses,
+            "ties": team.ties,
+            "points_for": team.points_for,
+            "points_against": team.points_against,
+            "acquisitions": team.acquisitions,
+            "drops": team.drops,
+            "trades": team.trades,
+            "playoff_pct": team.playoff_pct,
+            "final_standing": team.final_standing,
+            "outcomes": team.outcomes,
+        }
+    except Exception as error:
+        LOGGER.exception("Unable to retrieve team info")
+        return _error_message(error)
 
-            team_info = {
+
+@mcp.tool()
+def get_player_stats(
+    league_id: int, player_name: str, year: int = CURRENT_YEAR
+) -> dict[str, Any] | str:
+    """Find a rostered player by partial name and return season totals."""
+    try:
+        league = api.get_league(league_id, year)
+        query = player_name.strip().casefold()
+        if not query:
+            raise ValueError("player_name cannot be empty")
+
+        for team in league.teams:
+            for player in team.roster:
+                if query in player.name.casefold():
+                    return {
+                        "name": player.name,
+                        "position": player.position,
+                        "pro_team": player.proTeam,
+                        "fantasy_team": team.team_name,
+                        "points": player.total_points,
+                        "projected_points": player.projected_total_points,
+                        "injured": player.injured,
+                    }
+        return f"Player '{player_name}' was not found on a roster in league {league_id}."
+    except Exception as error:
+        LOGGER.exception("Unable to retrieve player stats")
+        return _error_message(error)
+
+
+@mcp.tool()
+def get_league_standings(league_id: int, year: int = CURRENT_YEAR) -> list[dict[str, Any]] | str:
+    """Get standings sorted by wins and then points scored."""
+    try:
+        league = api.get_league(league_id, year)
+        teams = sorted(
+            league.teams,
+            key=lambda team: (team.wins, team.points_for),
+            reverse=True,
+        )
+        return [
+            {
+                "rank": rank,
+                "team_id": getattr(team, "team_id", None),
                 "team_name": team.team_name,
-                "owner": team.owners,
+                "owners": team.owners,
                 "wins": team.wins,
                 "losses": team.losses,
                 "ties": team.ties,
                 "points_for": team.points_for,
                 "points_against": team.points_against,
-                "acquisitions": team.acquisitions,
-                "drops": team.drops,
-                "trades": team.trades,
-                "playoff_pct": team.playoff_pct,
-                "final_standing": team.final_standing,
-                "outcomes": team.outcomes
             }
-            
-            return str(team_info)
+            for rank, team in enumerate(teams, start=1)
+        ]
+    except Exception as error:
+        LOGGER.exception("Unable to retrieve league standings")
+        return _error_message(error)
 
-        except Exception as e:
-            log_error(f"Error retrieving team results: {str(e)}")
-            traceback.print_exc(file=sys.stderr)
-            if "401" in str(e) or "Private" in str(e):
-                return ("This appears to be a private league. Please use the authenticate tool first with your "
-                      "ESPN_S2 and SWID cookies to access private leagues.")
-            return f"Error retrieving team results: {str(e)}"
 
-    @mcp.tool()
-    async def get_player_stats(league_id: int, player_name: str, year: int = CURRENT_YEAR) -> str:
-        """Get stats for a specific player.
-        
-        Args:
-            league_id: The ESPN fantasy football league ID
-            player_name: Name of the player to search for
-            year: Optional year for historical data (defaults to current season)
-        """
-        try:
-            log_error(f"Getting player stats for {player_name} in league {league_id}, year {year}")
-            # Get league using stored credentials
-            league = api.get_league(SESSION_ID, league_id, year)
-            
-            # Search for player by name
-            player = None
-            for team in league.teams:
-                for roster_player in team.roster:
-                    if player_name.lower() in roster_player.name.lower():
-                        player = roster_player
-                        break
-                if player:
-                    break
-            
-            if not player:
-                return f"Player '{player_name}' not found in league {league_id}"
-            
-            # Get player stats
-            stats = {
-                "name": player.name,
-                "position": player.position,
-                "team": player.proTeam,
-                "points": player.total_points,
-                "projected_points": player.projected_total_points,
-                "stats": player.stats,
-                "injured": player.injured
-            }
-            
-            return str(stats)
-        except Exception as e:
-            log_error(f"Error retrieving player stats: {str(e)}")
-            traceback.print_exc(file=sys.stderr)
-            if "401" in str(e) or "Private" in str(e):
-                return ("This appears to be a private league. Please use the authenticate tool first with your "
-                      "ESPN_S2 and SWID cookies to access private leagues.")
-            return f"Error retrieving player stats: {str(e)}"
+@mcp.tool()
+def get_matchup_info(
+    league_id: int, week: int | None = None, year: int = CURRENT_YEAR
+) -> list[dict[str, Any]] | str:
+    """Get matchup scores for a week, defaulting to the league's current week."""
+    try:
+        league = api.get_league(league_id, year)
+        selected_week = league.current_week if week is None else week
+        if selected_week < 1 or selected_week > 18:
+            raise ValueError("week must be between 1 and 18")
 
-    @mcp.tool()
-    async def get_league_standings(league_id: int, year: int = CURRENT_YEAR) -> str:
-        """Get current standings for a league.
-        
-        Args:
-            league_id: The ESPN fantasy football league ID
-            year: Optional year for historical data (defaults to current season)
-        """
-        try:
-            log_error(f"Getting league standings for league {league_id}, year {year}")
-            # Get league using stored credentials
-            league = api.get_league(SESSION_ID, league_id, year)
-            
-            # Sort teams by wins (descending), then points (descending)
-            sorted_teams = sorted(league.teams, 
-                                key=lambda x: (x.wins, x.points_for),
-                                reverse=True)
-            
-            standings = []
-            for i, team in enumerate(sorted_teams):
-                standings.append({
-                    "rank": i + 1,
-                    "team_name": team.team_name,
-                    "owner": team.owners,
-                    "wins": team.wins,
-                    "losses": team.losses,
-                    "points_for": team.points_for,
-                    "points_against": team.points_against
-                })
-            
-            return str(standings)
-        except Exception as e:
-            log_error(f"Error retrieving league standings: {str(e)}")
-            traceback.print_exc(file=sys.stderr)
-            if "401" in str(e) or "Private" in str(e):
-                return ("This appears to be a private league. Please use the authenticate tool first with your "
-                      "ESPN_S2 and SWID cookies to access private leagues.")
-            return f"Error retrieving league standings: {str(e)}"
-
-    @mcp.tool()
-    async def get_matchup_info(league_id: int, week: int = None, year: int = CURRENT_YEAR) -> str:
-        """Get matchup information for a specific week.
-        
-        Args:
-            league_id: The ESPN fantasy football league ID
-            week: The week number (if None, uses current week)
-            year: Optional year for historical data (defaults to current season)
-        """
-        try:
-            log_error(f"Getting matchup info for league {league_id}, week {week}, year {year}")
-            # Get league using stored credentials
-            league = api.get_league(SESSION_ID, league_id, year)
-            
-            if week is None:
-                week = league.current_week
-                
-            if week < 1 or week > 17:  # Most leagues have 17 weeks max
-                return f"Invalid week number. Must be between 1 and 17"
-            
-            matchups = league.box_scores(week)
-            
-            matchup_info = []
-            for matchup in matchups:
-                matchup_info.append({
+        results: list[dict[str, Any]] = []
+        for matchup in league.box_scores(selected_week):
+            away_team = matchup.away_team
+            away_score = matchup.away_score if away_team else 0
+            if not away_team:
+                winner = "BYE"
+            elif matchup.home_score > away_score:
+                winner = "HOME"
+            elif away_score > matchup.home_score:
+                winner = "AWAY"
+            else:
+                winner = "TIE"
+            results.append(
+                {
+                    "week": selected_week,
                     "home_team": matchup.home_team.team_name,
                     "home_score": matchup.home_score,
-                    "away_team": matchup.away_team.team_name if matchup.away_team else "BYE",
-                    "away_score": matchup.away_score if matchup.away_team else 0,
-                    "winner": "HOME" if matchup.home_score > matchup.away_score else "AWAY" if matchup.away_score > matchup.home_score else "TIE"
-                })
-            
-            return str(matchup_info)
-        except Exception as e:
-            log_error(f"Error retrieving matchup information: {str(e)}")
-            traceback.print_exc(file=sys.stderr)
-            if "401" in str(e) or "Private" in str(e):
-                return ("This appears to be a private league. Please use the authenticate tool first with your "
-                      "ESPN_S2 and SWID cookies to access private leagues.")
-            return f"Error retrieving matchup information: {str(e)}"
+                    "away_team": away_team.team_name if away_team else "BYE",
+                    "away_score": away_score,
+                    "winner": winner,
+                }
+            )
+        return results
+    except Exception as error:
+        LOGGER.exception("Unable to retrieve matchup information")
+        return _error_message(error)
 
-    @mcp.tool()
-    async def logout() -> str:
-        """Clear stored authentication credentials for this session."""
-        try:
-            log_error("Logging out...")
-            # Clear credentials for this session
-            api.clear_credentials(SESSION_ID)
-            
-            return "Authentication credentials have been cleared."
-        except Exception as e:
-            log_error(f"Error logging out: {str(e)}")
-            traceback.print_exc(file=sys.stderr)
-            return f"Error logging out: {str(e)}"
 
-    if __name__ == "__main__":
-        # Run the server
-        log_error("Starting MCP server...")
-        mcp.run()
-except Exception as e:
-    # Log any exception that might occur during server initialization
-    log_error(f"ERROR DURING SERVER INITIALIZATION: {str(e)}")
-    traceback.print_exc(file=sys.stderr)
-    # Keep the process running to see logs
-    log_error("Server failed to start, but kept running for logging. Press Ctrl+C to exit.")
-    # Wait indefinitely to keep the process alive for logs
-    import time
-    while True:
-        time.sleep(10)
+def main() -> None:
+    """Run the original local stdio transport."""
+    mcp.run()
+
+
+if __name__ == "__main__":
+    main()
