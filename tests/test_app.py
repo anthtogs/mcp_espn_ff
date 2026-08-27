@@ -126,6 +126,9 @@ def test_chatgpt_oauth_discovery_and_pkce_flow(
         },
     )
     assert authorize_response.status_code == 200
+    assert "form-action 'self' https://chatgpt.com" in authorize_response.headers[
+        "content-security-policy"
+    ]
     match = re.search(r'name="request" value="([^"]+)"', authorize_response.text)
     assert match is not None
     pending_request = match.group(1)
