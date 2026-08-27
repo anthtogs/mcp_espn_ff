@@ -10,22 +10,39 @@ from typing import Any
 
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 
 from espn_fantasy_server import mcp
-
-
-MCP_ENDPOINT = "/api/mcp"
+from oauth import (
+    MCP_ENDPOINT,
+    OAuthConfigurationError,
+    authorization_server_metadata,
+    authorize,
+    oauth_configuration,
+    protected_resource_metadata,
+    token,
+    validate_access_token,
+    www_authenticate_header,
+)
 
 
 @mcp.custom_route("/", methods=["GET"])
 async def service_info(_: Request) -> JSONResponse:
+    try:
+        oauth_enabled = oauth_configuration().enabled
+    except OAuthConfigurationError:
+        oauth_enabled = False
     return JSONResponse(
         {
             "name": "ESPN Fantasy Football MCP Server",
             "transport": "Streamable HTTP",
             "mcp_endpoint": MCP_ENDPOINT,
             "health_endpoint": "/health",
+            "oauth": {
+                "enabled": oauth_enabled,
+                "protected_resource_metadata": "/.well-known/oauth-protected-resource",
+                "authorization_server_metadata": "/.well-known/oauth-authorization-server",
+            },
         }
     )
 
@@ -33,6 +50,27 @@ async def service_info(_: Request) -> JSONResponse:
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
+
+
+@mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
+@mcp.custom_route("/.well-known/oauth-protected-resource/api/mcp", methods=["GET"])
+async def oauth_protected_resource(request: Request) -> JSONResponse:
+    return await protected_resource_metadata(request)
+
+
+@mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
+async def oauth_authorization_server(request: Request) -> JSONResponse:
+    return await authorization_server_metadata(request)
+
+
+@mcp.custom_route("/oauth/authorize", methods=["GET", "POST"])
+async def oauth_authorize(request: Request) -> Response:
+    return await authorize(request)
+
+
+@mcp.custom_route("/oauth/token", methods=["POST"])
+async def oauth_token(request: Request) -> Response:
+    return await token(request)
 
 
 # Vercel terminates TLS and validates the public Host header before forwarding to
@@ -48,7 +86,7 @@ _mcp_app = mcp.streamable_http_app(
 
 
 class BearerAuthMiddleware:
-    """Protect the MCP route with MCP_API_KEY without affecting health routes."""
+    """Protect MCP with OAuth access tokens or the legacy MCP_API_KEY."""
 
     def __init__(self, asgi_app: Callable[..., Awaitable[None]]) -> None:
         self.asgi_app = asgi_app
@@ -63,24 +101,36 @@ class BearerAuthMiddleware:
             await self.asgi_app(scope, receive, send)
             return
 
-        expected = os.getenv("MCP_API_KEY")
+        expected_api_key = os.getenv("MCP_API_KEY")
         private_credentials_present = bool(os.getenv("ESPN_S2") or os.getenv("ESPN_SWID"))
-        if not expected and not private_credentials_present:
+        try:
+            oauth_config = oauth_configuration()
+        except OAuthConfigurationError as error:
+            await self._json_error(send, 503, str(error))
+            return
+
+        if not expected_api_key and not oauth_config.enabled and not private_credentials_present:
             await self.asgi_app(scope, receive, send)
             return
 
-        if not expected:
+        if private_credentials_present and not expected_api_key and not oauth_config.enabled:
             await self._json_error(
                 send,
                 503,
-                "MCP_API_KEY must be configured whenever ESPN credentials are present.",
+                "Configure OAuth or MCP_API_KEY whenever ESPN credentials are present.",
             )
             return
 
         headers = {key.lower(): value for key, value in scope.get("headers", [])}
         supplied = headers.get(b"authorization", b"").decode("latin-1")
-        wanted = f"Bearer {expected}"
-        if not hmac.compare_digest(supplied, wanted):
+        bearer = supplied[7:] if supplied.lower().startswith("bearer ") else ""
+        api_key_valid = bool(
+            expected_api_key
+            and bearer
+            and hmac.compare_digest(bearer.encode(), expected_api_key.encode())
+        )
+        oauth_valid = bool(bearer and oauth_config.enabled and validate_access_token(bearer))
+        if not api_key_valid and not oauth_valid:
             await self._json_error(send, 401, "Unauthorized", authenticate=True)
             return
 
@@ -97,7 +147,16 @@ class BearerAuthMiddleware:
         body = json.dumps({"detail": detail}).encode()
         headers = [(b"content-type", b"application/json")]
         if authenticate:
-            headers.append((b"www-authenticate", b"Bearer"))
+            try:
+                config = oauth_configuration()
+                challenge = (
+                    www_authenticate_header().encode()
+                    if config.enabled
+                    else b"Bearer"
+                )
+            except OAuthConfigurationError:
+                challenge = b"Bearer"
+            headers.append((b"www-authenticate", challenge))
         await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": body})
 

@@ -11,6 +11,7 @@ from typing import Any
 
 from espn_api.football import League
 from mcp.server import MCPServer
+from mcp.types import ToolAnnotations
 
 
 LOGGER = logging.getLogger("mcp_espn_ff")
@@ -24,6 +25,15 @@ def default_season() -> int:
 
 
 CURRENT_YEAR = default_season()
+READ_ONLY_ANNOTATIONS = ToolAnnotations(
+    read_only_hint=True,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=True,
+)
+OAUTH_TOOL_META = {
+    "securitySchemes": [{"type": "oauth2", "scopes": ["fantasy:read"]}]
+}
 
 
 class ESPNConfigurationError(RuntimeError):
@@ -110,7 +120,7 @@ def _team_by_id(league: League, team_id: int) -> Any:
 api = ESPNFantasyFootballAPI()
 mcp = MCPServer(
     "espn-fantasy-football",
-    version="0.2.0",
+    version="0.3.0",
     description="Read ESPN fantasy football league, roster, player, standings, and matchup data.",
     instructions=(
         "Use the requested league id and season. Private-league credentials are configured "
@@ -119,7 +129,7 @@ mcp = MCPServer(
 )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS, meta=OAUTH_TOOL_META)
 def get_league_info(league_id: int, year: int = CURRENT_YEAR) -> dict[str, Any] | str:
     """Get basic information about an ESPN fantasy football league."""
     try:
@@ -138,7 +148,7 @@ def get_league_info(league_id: int, year: int = CURRENT_YEAR) -> dict[str, Any] 
         return _error_message(error)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS, meta=OAUTH_TOOL_META)
 def get_team_roster(
     league_id: int, team_id: int, year: int = CURRENT_YEAR
 ) -> dict[str, Any] | str:
@@ -168,7 +178,7 @@ def get_team_roster(
         return _error_message(error)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS, meta=OAUTH_TOOL_META)
 def get_team_info(
     league_id: int, team_id: int, year: int = CURRENT_YEAR
 ) -> dict[str, Any] | str:
@@ -197,7 +207,7 @@ def get_team_info(
         return _error_message(error)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS, meta=OAUTH_TOOL_META)
 def get_player_stats(
     league_id: int, player_name: str, year: int = CURRENT_YEAR
 ) -> dict[str, Any] | str:
@@ -226,7 +236,7 @@ def get_player_stats(
         return _error_message(error)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS, meta=OAUTH_TOOL_META)
 def get_league_standings(league_id: int, year: int = CURRENT_YEAR) -> list[dict[str, Any]] | str:
     """Get standings sorted by wins and then points scored."""
     try:
@@ -255,7 +265,7 @@ def get_league_standings(league_id: int, year: int = CURRENT_YEAR) -> list[dict[
         return _error_message(error)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS, meta=OAUTH_TOOL_META)
 def get_matchup_info(
     league_id: int, week: int | None = None, year: int = CURRENT_YEAR
 ) -> list[dict[str, Any]] | str:
